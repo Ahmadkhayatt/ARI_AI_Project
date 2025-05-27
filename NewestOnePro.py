@@ -18,6 +18,7 @@ import os
 from dotenv import load_dotenv
 
 
+
 warnings.filterwarnings("ignore", message="FP16 is not supported on CPU*")
 
 # ElevenLabs config
