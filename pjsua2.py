@@ -217,28 +217,86 @@ class GoogleStreamer:
         self._closed.set()
 
 
+class VadDetector(threading.Thread):
+    """
+    Monitors an audio queue using WebRTCVAD to detect speech.
+    When speech is detected, it puts a message on an interrupt queue.
+    """
+    def __init__(self, audio_queue, interrupt_queue):
+        super().__init__()
+        self.audio_queue = audio_queue
+        self.interrupt_queue = interrupt_queue
+        self.vad = webrtcvad.Vad()
+        self.vad.set_mode(1)  # Aggressiveness mode (0-3). 1 is a good balance.
+        self.is_monitoring = threading.Event() # Use an Event to control when VAD is active
+        self._stop_event = threading.Event()
+        
+        # WebRTC VAD requires 10, 20, or 30 ms frames.
+        # Your chunk size is already 30ms, which is perfect.
+        self.frame_duration_ms = 30
+        self.frame_bytes = int(SAMPLE_RATE * (self.frame_duration_ms / 1000.0) * 2)
+
+    def run(self):
+        print("✅ VAD Detector thread started.")
+        while not self._stop_event.is_set():
+            try:
+                chunk = self.audio_queue.get(timeout=0.1)
+                if self.is_monitoring.is_set():
+                    is_speech = self.vad.is_speech(chunk, SAMPLE_RATE)
+                    if is_speech:
+                        print("🎤 VAD: User speech detected! Sending interrupt.")
+                        self.interrupt_queue.put(True)
+                        self.is_monitoring.clear() # Stop monitoring after first detection
+            except queue.Empty:
+                continue
+            except Exception as e:
+                print(f"❌ VAD Error: {e}")
+        print("⏹️ VAD Detector thread stopped.")
+
+    def start_monitoring(self):
+        self.is_monitoring.set()
+
+    def stop_monitoring(self):
+        self.is_monitoring.clear()
+
+    def stop(self):
+        self._stop_event.set()
+
 # === Main Conversation Logic ===
-def interact_with_user(channel_id, recording_file, recording_name):
-    global channel_id1 
-    """ Handles the main conversation flow for a single call. """
+# === Main Conversation Logic ===
+## Main Interaction Logic
+def interact_with_user(channel_id, snoop_channel_id, recording_file, recording_name):
+    """
+    Handles conversation flow with STT-based interruption.
+    """
     print(f"🚀 Interaction starting for channel {channel_id}.")
     stt_queue = queue.Queue()
-    # The VAD queue is not used since interruption is disabled, but we leave the plumbing.
-    vad_queue = queue.Queue()
+    stt_result_queue = queue.Queue()
+    stt_stop_event = threading.Event()
 
-    audio_streamer = AsteriskLiveAudioStreamer(recording_file, [stt_queue, vad_queue])
+    audio_streamer = AsteriskLiveAudioStreamer(recording_file, [stt_queue])
     stt_client = GoogleStreamer(stt_queue)
-
+    
     audio_streamer.start()
+
+    # Start the STT listener thread
+    stt_thread = threading.Thread(
+        target=run_stt_listener,
+        args=(stt_client, stt_result_queue, stt_stop_event)
+    )
+    stt_thread.start()
+
     chat_session = model.start_chat(history=[{"role": "user", "parts": [prompt]}])
     stop_words = ["exit", "kapat", "bitir"]
 
     try:
-        while not audio_streamer._stop_event.is_set():
-            user_text = stt_client.listen()
-            if not user_text:
-                print("⚠️ No input detected, listening again.")
-                continue
+        while True:
+            # Wait for a transcript from the STT thread
+            try:
+                user_text = stt_result_queue.get(timeout=3600) # Wait a long time for user to speak
+            except queue.Empty:
+                print(" timed out waiting for user input. Exiting.")
+                break
 
             print(f"📝 User said: {user_text}")
             if any(word in user_text.lower() for word in stop_words):
@@ -249,81 +307,43 @@ def interact_with_user(channel_id, recording_file, recording_name):
             reply = response.text.strip()
             print(f"🤖 Gemini: {reply}")
 
-            # === Playback Section ===
-            # This simplified version disables interruptions to ensure playback works first.
-            # PASTE THIS NEW BLOCK INTO YOUR main.py
-
-    # === NEW, W# PASTE THIS NEW DIAGNOSTIC BLOCK INTO YOUR main.py
-
-            # === FINAL, CORRECT PLAYBACK LOGIC ===
-            # The new, clean playback section for interact_with_user
-            # === Final Working Playback ===
-
-            reply_text = reply
-            media_id = speak_and_prepare_for_asterisk(reply_text)
+            media_id = speak_and_prepare_for_asterisk(reply)
 
             if media_id:
-                try:
-
-                    print(f"  [INFO] Asking ARI to play 'sound:{media_id}'")
-                    url = f"{BASE_URL}/channels/{channel_id}/play"
-                    print("DEBUG → URL:", url)
-                    print("DEBUG → params:", {"media":f"sound:{media_id}"})
-                   
-                    print("channel id : ", channel_id)
-
-
-                    # response = requests.post(
-                    #     url,
-                    #     params={"media": f"sound:{media_id}.wav"},
-                    #     auth=HTTPBasicAuth(ARI_USER, ARI_PASSWORD),
-                    #     timeout=5
-                    # )
-
-                    stop_resp = requests.post(
-                        f"{BASE_URL}/recordings/live/{recording_name}/stop",
-                        auth=HTTPBasicAuth(ARI_USER, ARI_PASSWORD)
-                    )
-                    print("Stopped recording ", stop_resp.status_code, stop_resp.text)
-
-                    audio_streamer.stop()
-                    audio_streamer.join()
-
-                    with stt_queue.mutex:
-                        stt_queue.queue.clear()
-                    with vad_queue.mutex:
-                        vad_queue.queue.clear()
-
-                    time.sleep(1)
-                    response = requests.post(
-                        f"{BASE_URL}/channels/{channel_id}/play",
-                        params={"media": f"sound:ai_agent_response" , "replaceMedia": True},
-                        auth=HTTPBasicAuth(ARI_USER, ARI_PASSWORD)                        
-                    )
-                    response
-                    print("DEBUG → Response status:", response.status_code)
-                    print("DEBUG → Response body:", response.text)
-                    print(f"  [INFO] ARI responded with status: {response.status_code}")
-                    # Wait for the audio to play
-                    time.sleep(5)
-
-                    requests.post(
-                    f"{BASE_URL}/channels/{channel_id}/record",
-                    params={
-                        "name": recording_name,
-                        "format": "sln16",
-                        "ifExists": "overwrite"
-                    },
+                play_response = requests.post(
+                    f"{BASE_URL}/channels/{channel_id}/play",
+                    params={"media": f"sound:{media_id}"},
                     auth=HTTPBasicAuth(ARI_USER, ARI_PASSWORD)
                 )
-                    # and spin up a brand-new streamer hooked to that fresh file
-                    audio_streamer = AsteriskLiveAudioStreamer(recording_file,
-                                                                [stt_queue, vad_queue])
-                    audio_streamer.start()
 
-                except requests.RequestException as e:
-                    print(f"  [ERROR] The request to Asterisk failed: {e}")
-            print("--- Exiting Playback Section ---")
+                if 200 <= play_response.status_code < 300:
+                    playback_id = play_response.json().get('id')
+                    print(f"  [INFO] Playback {playback_id} started. Monitoring for STT-based interruption...")
+
+                    interrupted = False
+                    while True:
+                        # Check for user interruption via a new STT result
+                        try:
+                            # Use a short timeout to prevent blocking
+                            interrupt_text = stt_result_queue.get(timeout=0.1) 
+                            print(f"  [INTERRUPT] New STT result '{interrupt_text}' received. Stopping playback.")
+                            requests.delete(f"{BASE_URL}/playbacks/{playback_id}", auth=HTTPBasicAuth(ARI_USER, ARI_PASSWORD))
+                            # Put the text back in the queue to be processed next
+                            stt_result_queue.put(interrupt_text)
+                            interrupted = True
+                            break
+                        except queue.Empty:
+                            pass # No interruption, continue
+
+                        # Check if playback finished on its own
+                        status_resp = requests.get(f"{BASE_URL}/playbacks/{playback_id}", auth=HTTPBasicAuth(ARI_USER, ARI_PASSWORD))
+                        if status_resp.status_code == 404:
+                            print("  [INFO] Playback finished naturally.")
+                            break
+                    
+                    if interrupted:
+                        continue # Go to the top of the main loop to process the new text
+
             closing_phrases = ["anketimiz sona erdi"]
             if any(phrase in reply.lower() for phrase in closing_phrases):
                 print("📴 Ending call based on Gemini response.")
@@ -333,20 +353,39 @@ def interact_with_user(channel_id, recording_file, recording_name):
         print(f"❌ An error occurred in the interaction loop: {e}")
     finally:
         print(f"🧹 Cleaning up resources for channel {channel_id}")
+        stt_stop_event.set()
         stt_client.close()
         audio_streamer.stop()
+        stt_thread.join()
         audio_streamer.join()
-        
+
+        requests.delete(f"{BASE_URL}/channels/{snoop_channel_id}", auth=HTTPBasicAuth(ARI_USER, ARI_PASSWORD))
         requests.delete(f"{BASE_URL}/channels/{channel_id}", auth=HTTPBasicAuth(ARI_USER, ARI_PASSWORD))
+
         if os.path.exists(recording_file):
             try:
                 os.remove(recording_file)
                 print(f"🗑️ Deleted recording file: {recording_file}")
             except OSError as e:
-                print(f"   Error deleting recording file: {e}")
-
-
+                print(f"   Error deleting recording file: {e}")# === WebSocket Event Handlers ===
 # === WebSocket Event Handlers ===
+## on_message Function
+
+## STT Worker Function
+def run_stt_listener(stt_client, result_queue, stop_event):
+    """
+    Runs in a dedicated thread to listen for a single utterance
+    and put the result onto a queue.
+    """
+    print("  [STT Thread] Starting to listen for user input...")
+    while not stop_event.is_set():
+        transcript = stt_client.listen()
+        if transcript:
+            print(f"  [STT Thread] Detected transcript: '{transcript}'. Placing in queue.")
+            result_queue.put(transcript)
+        # If listen() returns None (due to timeout), the loop continues and listens again.
+    print("  [STT Thread] Stopped.")
+
 def on_message(ws, message):
     import threading
     event = json.loads(message)
@@ -355,39 +394,44 @@ def on_message(ws, message):
 
     if event_type == 'StasisStart':
         channel_id = event['channel']['id']
-        print(f"Channel {channel_id} entered Stasis. Answering and starting recording.")
-        # 1) Answer the call
+        print(f"Channel {channel_id} entered Stasis. Answering and preparing to snoop.")
+        
         requests.post(
             f"{BASE_URL}/channels/{channel_id}/answer",
             auth=HTTPBasicAuth(ARI_USER, ARI_PASSWORD)
         )
 
-        # 2) Start SLIN16 recording
-        simple_name = f"live_rec_{channel_id}"
-        print("for debugging:", simple_name)
+        try:
+            snoop_response = requests.post(
+                f"{BASE_URL}/channels/{channel_id}/snoop",
+                params={"app": ARI_APP, "spy": "in"},
+                auth=HTTPBasicAuth(ARI_USER, ARI_PASSWORD)
+            )
+            snoop_response.raise_for_status()
+            snoop_channel_id = snoop_response.json()['id']
+            print(f"✅ Snoop channel {snoop_channel_id} created.")
+        except requests.RequestException as e:
+            print(f"❌ Failed to create snoop channel: {e}")
+            requests.delete(f"{BASE_URL}/channels/{channel_id}", auth=HTTPBasicAuth(ARI_USER, ARI_PASSWORD))
+            return
+
+        recording_name = f"live_rec_{channel_id}"
         requests.post(
-            f"{BASE_URL}/channels/{channel_id}/record",
-            params={
-                "name": simple_name,
-                "format": "sln16",
-                "ifExists": "overwrite"
-            },
+            f"{BASE_URL}/channels/{snoop_channel_id}/record",
+            params={"name": recording_name, "format": "sln16", "ifExists": "overwrite"},
             auth=HTTPBasicAuth(ARI_USER, ARI_PASSWORD)
         )
+        print(f"✅ Recording started on snoop channel {snoop_channel_id}.")
 
-        # 3) Spawn exactly one interaction thread
-        slin_path = os.path.join(LIVE_RECORDING_PATH, f"{simple_name}.sln16")
+        slin_path = os.path.join(LIVE_RECORDING_PATH, f"{recording_name}.sln16")
         threading.Thread(
             target=interact_with_user,
-            args=(channel_id, slin_path, simple_name),
+            args=(channel_id, snoop_channel_id, slin_path, recording_name),
             daemon=True
         ).start()
 
     elif event_type == 'StasisEnd':
-        print("📞 Call ended and channel destroyed.")
-
-
-# === Outbound Call Originate ===
+        print("📞 Call ended and channel destroyed.")# === Outbound Call Originate ===
 def originate_call():
     """Initiates an outbound call to a specified endpoint."""
     print("📞 Attempting to originate an outbound call...")
