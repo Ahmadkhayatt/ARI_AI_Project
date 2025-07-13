@@ -46,4 +46,4 @@ Use it to create:
 | 🧏 Whisper / Google STT | Speech-to-text recognition |
 
 This project is 
-STILL WORKING ON .... :)
+Old version 
